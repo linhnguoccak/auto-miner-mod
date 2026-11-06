@@ -21,81 +21,83 @@ public class AutoMinerController {
     // ── Cấu hình ──────────────────────────────────────────────────────────
     private static final float DURABILITY_THRESHOLD = 0.30f;
     private static final int   HUNGER_THRESHOLD     = 16;
-    private static final int   BREAK_COOLDOWN       = 2;
+    private static final int   BREAK_COOLDOWN       = 6;
     private static final int   ACTION_DELAY         = 5;
 
     // ── Frame ─────────────────────────────────────────────────────────────
     private BlockPos frameA     = null;
     private BlockPos frameB     = null;
     private int      frameCount = 0;
-
-    private int minX, maxX, minY, maxY, minZ, maxZ;
+    private int      minX, maxX, minY, maxY, minZ, maxZ;
 
     // ── Trạng thái ────────────────────────────────────────────────────────
     private boolean    active       = false;
     private MinerState state        = MinerState.IDLE;
     private int        cooldown     = 0;
 
-    private BlockPos   centerTarget = null;
-    private int        breakIndex   = 0;
     private Direction  mineDir      = Direction.NORTH;
 
-    private int        currentStep  = 0;
-    private int        totalSteps   = 0;
+    // Lớp ngang hiện tại (0 = lớp trên cùng, tăng dần xuống)
+    // Mỗi lớp cao 3 block (đủ để đi lại)
+    private int        currentFloor  = 0;
+    private int        totalFloors   = 0;
 
-    // ── Frame Key Handler ─────────────────────────────────────────────────
+    // Bước dọc theo hướng đào trong lớp hiện tại
+    private int        currentStep   = 0;
+    private int        totalSteps    = 0;
+
+    private BlockPos   standPos      = null;
+    private BlockPos   targetBlock   = null;
+
+    // ── Public API ────────────────────────────────────────────────────────
+    public boolean  isActive()      { return active; }
+    public boolean  hasFrame()      { return frameCount >= 1; }
+    public int      getFrameCount() { return frameCount; }
+    public BlockPos getFrameA()     { return frameA; }
+    public BlockPos getFrameB()     { return frameB; }
+
+    // ── Frame Key ─────────────────────────────────────────────────────────
     public void handleFrameKey(MinecraftClient client) {
         if (client.player == null) return;
         BlockPos pos = client.player.getBlockPos();
-
         if (frameCount == 0) {
-            frameA = pos;
-            frameCount = 1;
-            AutoMinerMod.msg(client, "§eGóc A đã set: §f" + posStr(pos)
-                + " §7| Bấm §eH§7 lần 2 để set Góc B");
+            frameA = pos; frameCount = 1;
+            AutoMinerMod.msg(client, "§eGóc A: §f" + posStr(pos)
+                + " §7| §eH§7 lần 2 set Góc B");
         } else if (frameCount == 1) {
-            frameB = pos;
-            frameCount = 2;
+            frameB = pos; frameCount = 2;
             computeBounds();
-            int dx = maxX - minX + 1;
-            int dy = maxY - minY + 1;
-            int dz = maxZ - minZ + 1;
-            AutoMinerMod.msg(client, "§aKhung đã set! §f"
-                + posStr(frameA) + " §7→ §f" + posStr(frameB)
-                + " §7(§e" + dx + "×" + dy + "×" + dz + "§7)"
-                + " | §eJ§7 bắt đầu | §eH§7 lần 3 xoá");
+            AutoMinerMod.msg(client, "§aKhung OK! §f"
+                + posStr(frameA) + "§7→§f" + posStr(frameB)
+                + " §7(§e"+(maxX-minX+1)+"×"+(maxY-minY+1)+"×"+(maxZ-minZ+1)+"§7)"
+                + " | §eJ§7 đào | §eH§7×3 xoá");
         } else {
-            frameA     = null;
-            frameB     = null;
-            frameCount = 0;
-            if (active) {
-                active = false;
-                stopMoving(client);
-            }
-            AutoMinerMod.msg(client, "§cĐã xoá khung. §7Bấm §eH§7 để set lại.");
+            frameA = null; frameB = null; frameCount = 0;
+            if (active) { active = false; stopAll(client); }
+            AutoMinerMod.msg(client, "§cĐã xoá khung.");
         }
     }
 
     // ── Toggle ────────────────────────────────────────────────────────────
-    public boolean isActive() { return active; }
-
     public void toggle(MinecraftClient client) {
         if (!active) {
             if (frameCount < 2) {
-                AutoMinerMod.msg(client, "§cChưa set khung! §7Bấm §eH§7 2 lần để set 2 góc.");
+                AutoMinerMod.msg(client, "§cChưa set khung! §eH§7 2 lần.");
                 return;
             }
-            active      = true;
-            state       = MinerState.IDLE;
-            breakIndex  = 0;
-            currentStep = 0;
-            mineDir     = getPlayerFacingDir(client);
+            active       = true;
+            currentFloor = 0;
+            currentStep  = 0;
+            mineDir      = getPlayerFacingDir(client);
+            computeTotalFloors();
             computeTotalSteps();
-            AutoMinerMod.msg(client, "§aBẬT §f- Hướng: §e" + mineDir.name()
-                + " §f| §e" + totalSteps + " §flayer | §eJ§f tắt");
+            computeCurrentLayer();
+            state        = MinerState.WALK_TO_BLOCK;
+            AutoMinerMod.msg(client, "§aBẬT | §ehướng §f" + mineDir.name()
+                + " §e| " + totalSteps + " §fbước §e| " + totalFloors + " §ftầng");
         } else {
             active = false;
-            stopMoving(client);
+            stopAll(client);
             AutoMinerMod.msg(client, "§cTẮT");
         }
     }
@@ -107,347 +109,319 @@ public class AutoMinerController {
 
         ClientPlayerEntity player = client.player;
 
+        // Interrupts
         if (needsEating(player)) {
-            stopMoving(client);
-            state = MinerState.EATING;
+            stopAll(client);
             tryEat(client, player);
-            cooldown = ACTION_DELAY;
+            cooldown = 32;
             return;
         }
-
         if (pickaxeLow(player)) {
-            stopMoving(client);
-            state = MinerState.THROWING_XP;
+            stopAll(client);
             throwExpBottle(client, player);
             cooldown = ACTION_DELAY;
             return;
         }
-
         if (!hasTotemInOffhand(player)) {
-            int slot = findItem(player, Items.TOTEM_OF_UNDYING);
-            if (slot != -1) {
-                state = MinerState.EQUIP_TOTEM;
-                equipOffhand(client, player, slot);
-                cooldown = ACTION_DELAY;
+            int s = findItem(player, Items.TOTEM_OF_UNDYING);
+            if (s != -1) { equipOffhand(client, player, s); cooldown = ACTION_DELAY; return; }
+        }
+        ensurePickaxeMainHand(player);
+
+        switch (state) {
+            case WALK_TO_BLOCK  -> doWalkToStand(client, player);
+            case BREAKING       -> doBreakCenter(client, player);
+            case MOVING_FORWARD -> doAdvance(client, player);
+            case DESCEND        -> doDescend(client, player);
+            case DONE           -> {
+                stopAll(client);
+                active = false;
+                AutoMinerMod.msg(client, "§aXong! Đã đào hết khung.");
+            }
+            default -> state = MinerState.WALK_TO_BLOCK;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // WALK TO STAND POSITION
+    // ══════════════════════════════════════════════════════════════════════
+    private void doWalkToStand(MinecraftClient client, ClientPlayerEntity player) {
+        if (standPos == null) { state = MinerState.DONE; return; }
+
+        Vec3d pv   = new Vec3d(player.getX(), player.getY(), player.getZ());
+        Vec3d sv   = Vec3d.ofCenter(standPos);
+        double dist = Math.sqrt(
+            (pv.x - sv.x)*(pv.x - sv.x) + (pv.z - sv.z)*(pv.z - sv.z)
+        );
+
+        if (dist < 0.5) {
+            stopMoving(client);
+            state    = MinerState.BREAKING;
+            cooldown = 2;
+            return;
+        }
+
+        lookAt(player, sv);
+        client.options.forwardKey.setPressed(true);
+        client.options.jumpKey.setPressed(standPos.getY() > player.getBlockPos().getY());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // BREAK CENTER — đào 1 cú, cúp 3×3 phá hết layer
+    // ══════════════════════════════════════════════════════════════════════
+    private void doBreakCenter(MinecraftClient client, ClientPlayerEntity player) {
+        if (targetBlock == null) { state = MinerState.MOVING_FORWARD; return; }
+
+        lookAt(player, Vec3d.ofCenter(targetBlock));
+        Direction face = getBreakFace(targetBlock, player);
+        client.interactionManager.updateBlockBreakingProgress(targetBlock, face);
+        client.interactionManager.attackBlock(targetBlock, face);
+
+        state    = MinerState.MOVING_FORWARD;
+        cooldown = BREAK_COOLDOWN;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ADVANCE — tiến 1 bước, nếu hết bước thì xuống tầng
+    // ══════════════════════════════════════════════════════════════════════
+    private void doAdvance(MinecraftClient client, ClientPlayerEntity player) {
+        currentStep++;
+
+        if (currentStep >= totalSteps) {
+            // Hết lớp ngang → xuống tầng
+            currentFloor++;
+            if (currentFloor >= totalFloors) {
+                state = MinerState.DONE;
+                return;
+            }
+            // Reset bước cho tầng mới
+            currentStep = 0;
+            state       = MinerState.DESCEND;
+            cooldown    = 3;
+            AutoMinerMod.msg(client, "§6Xong tầng §e" + currentFloor
+                + "§6/§e" + totalFloors + "§6 — đào xuống...");
+        } else {
+            computeCurrentLayer();
+            state    = MinerState.WALK_TO_BLOCK;
+            cooldown = 3;
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DESCEND — đào xuống 3 ô rồi đến stand pos tầng mới
+    // ══════════════════════════════════════════════════════════════════════
+    private void doDescend(MinecraftClient client, ClientPlayerEntity player) {
+        ClientWorld world = client.world;
+        if (world == null) return;
+
+        // Tính Y đáy của tầng mới
+        int floorTopY = maxY - currentFloor * 3;    // Y trần của tầng mới
+        int standY    = floorTopY - 1;              // Y player sẽ đứng
+
+        // Đào block dưới chân cho đến khi trống xuống standY
+        for (int i = 1; i <= 3; i++) {
+            BlockPos below = player.getBlockPos().down(i);
+            if (below.getY() < minY) { state = MinerState.DONE; return; }
+            if (!isAirOrPassable(world.getBlockState(below).getBlock())) {
+                // Nhìn xuống và đào
+                player.setPitch(89f);
+                client.interactionManager.updateBlockBreakingProgress(below, Direction.UP);
+                client.interactionManager.attackBlock(below, Direction.UP);
+                cooldown = BREAK_COOLDOWN;
                 return;
             }
         }
 
-        ensurePickaxeMainHand(player);
+        // Đã đào xong 3 ô → kiểm tra player đã rơi xuống chưa
+        if (player.getY() > standY + 1.0) {
+            // Nhích về phía lỗ để rơi xuống
+            client.options.sneakKey.setPressed(true);
+            lookInDirection(player, mineDir);
+            cooldown = 2;
+        } else {
+            // Đã xuống đủ
+            client.options.sneakKey.setPressed(false);
+            computeCurrentLayer();
+            state    = MinerState.WALK_TO_BLOCK;
+            cooldown = 5;
+            AutoMinerMod.msg(client, "§aTầng §e" + (currentFloor + 1)
+                + "§a/§e" + totalFloors);
+        }
+    }
 
-        switch (state) {
-            case IDLE           -> startNextLayer(client, player);
-            case BREAKING       -> doBreak(client, player);
-            case PLACING_FLOOR  -> doPlaceFloor(client, player);
-            case MOVING_FORWARD -> doMove(client, player);
-            case DONE           -> {
-                stopMoving(client);
-                active = false;
-                AutoMinerMod.msg(client, "§aĐào xong toàn bộ khung!");
+    // ══════════════════════════════════════════════════════════════════════
+    // LAYER COMPUTATION
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Tính standPos và targetBlock cho (currentFloor, currentStep).
+     *
+     * Mỗi tầng (floor) cao 3 block.
+     * floorTopY = maxY - floor*3        → Y trần của tầng
+     * standY    = floorTopY - 1         → Y player đứng (chân ở đây, đầu ở floorTopY)
+     * centerY   = standY + 1            → Y ngang mắt (block giữa của tường 3×3)
+     *
+     * standPos  = lùi lại 1 block so với tường
+     * targetBlock = block CENTER của tường
+     */
+    private void computeCurrentLayer() {
+        int floorTopY = maxY - currentFloor * 3;
+        int standY    = floorTopY - 1;
+        int centerY   = standY + 1; // ngang mắt player
+
+        int cx = (minX + maxX) / 2;
+        int cz = (minZ + maxZ) / 2;
+
+        switch (mineDir) {
+            case NORTH -> {
+                int wallZ   = maxZ - currentStep;
+                targetBlock = new BlockPos(cx, centerY, wallZ);
+                standPos    = new BlockPos(cx, standY, wallZ + 1);
             }
-            default -> state = MinerState.IDLE;
+            case SOUTH -> {
+                int wallZ   = minZ + currentStep;
+                targetBlock = new BlockPos(cx, centerY, wallZ);
+                standPos    = new BlockPos(cx, standY, wallZ - 1);
+            }
+            case EAST -> {
+                int wallX   = minX + currentStep;
+                targetBlock = new BlockPos(wallX, centerY, cz);
+                standPos    = new BlockPos(wallX - 1, standY, cz);
+            }
+            case WEST -> {
+                int wallX   = maxX - currentStep;
+                targetBlock = new BlockPos(wallX, centerY, cz);
+                standPos    = new BlockPos(wallX + 1, standY, cz);
+            }
+            default -> { targetBlock = null; standPos = null; }
+        }
+
+        if (targetBlock != null && !inBounds(targetBlock)) {
+            targetBlock = null; standPos = null;
+            state = MinerState.DONE;
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // LAYER LOGIC
-    // ══════════════════════════════════════════════════════════════════════
-
-    private void startNextLayer(MinecraftClient client, ClientPlayerEntity player) {
-        if (currentStep >= totalSteps) {
-            state = MinerState.DONE;
-            return;
-        }
-        centerTarget = getLayerCenter(currentStep);
-        if (!inBounds(centerTarget)) {
-            state = MinerState.DONE;
-            return;
-        }
-        breakIndex = 0;
-        state      = MinerState.BREAKING;
-        cooldown   = 1;
-    }
-
-    private BlockPos getLayerCenter(int step) {
-        return switch (mineDir) {
-            case NORTH -> new BlockPos((minX + maxX) / 2, (minY + maxY) / 2, maxZ - step);
-            case SOUTH -> new BlockPos((minX + maxX) / 2, (minY + maxY) / 2, minZ + step);
-            case EAST  -> new BlockPos(minX + step, (minY + maxY) / 2, (minZ + maxZ) / 2);
-            case WEST  -> new BlockPos(maxX - step, (minY + maxY) / 2, (minZ + maxZ) / 2);
-            case DOWN  -> new BlockPos((minX + maxX) / 2, maxY - step, (minZ + maxZ) / 2);
-            default    -> new BlockPos((minX + maxX) / 2, (minY + maxY) / 2, maxZ - step);
+    private void computeTotalSteps() {
+        totalSteps = switch (mineDir) {
+            case NORTH, SOUTH -> maxZ - minZ + 1;
+            case EAST,  WEST  -> maxX - minX + 1;
+            default           -> 1;
         };
     }
 
-    private BlockPos[] getLayer3x3(BlockPos center) {
-        int[] dx, dy, dz;
-        if (mineDir == Direction.NORTH || mineDir == Direction.SOUTH) {
-            dx = new int[]{-1,-1,-1, 0, 0, 0, 1, 1, 1};
-            dy = new int[]{-1, 0, 1,-1, 0, 1,-1, 0, 1};
-            dz = new int[]{ 0, 0, 0, 0, 0, 0, 0, 0, 0};
-        } else if (mineDir == Direction.EAST || mineDir == Direction.WEST) {
-            dx = new int[]{ 0, 0, 0, 0, 0, 0, 0, 0, 0};
-            dy = new int[]{-1, 0, 1,-1, 0, 1,-1, 0, 1};
-            dz = new int[]{-1,-1,-1, 0, 0, 0, 1, 1, 1};
-        } else {
-            dx = new int[]{-1,-1,-1, 0, 0, 0, 1, 1, 1};
-            dy = new int[]{ 0, 0, 0, 0, 0, 0, 0, 0, 0};
-            dz = new int[]{-1, 0, 1,-1, 0, 1,-1, 0, 1};
-        }
-        BlockPos[] arr = new BlockPos[9];
-        for (int j = 0; j < 9; j++) {
-            arr[j] = clampToBounds(center.add(dx[j], dy[j], dz[j]));
-        }
-        return arr;
-    }
-
-    private void doBreak(MinecraftClient client, ClientPlayerEntity player) {
-        ClientWorld world = client.world;
-        if (world == null) return;
-
-        BlockPos[] layer = getLayer3x3(centerTarget);
-
-        while (breakIndex < 9 &&
-              (isAirOrPassable(world.getBlockState(layer[breakIndex]).getBlock())
-               || !inBounds(layer[breakIndex]))) {
-            breakIndex++;
-        }
-
-        if (breakIndex >= 9) {
-            breakIndex = 0;
-            state      = MinerState.PLACING_FLOOR;
-            cooldown   = 2;
-            return;
-        }
-
-        BlockPos target = layer[breakIndex];
-        Vec3d eyePos = new Vec3d(
-            player.getX(),
-            player.getY() + player.getEyeHeight(player.getPose()),
-            player.getZ()
-        );
-        Vec3d targetVec = Vec3d.ofCenter(target);
-        lookAt(player, targetVec);
-
-        if (eyePos.distanceTo(targetVec) <= 5.0) {
-            Direction face = getBreakFace(target, player);
-            client.interactionManager.updateBlockBreakingProgress(target, face);
-            client.interactionManager.attackBlock(target, face);
-            breakIndex++;
-            cooldown = BREAK_COOLDOWN;
-        } else {
-            breakIndex++;
-        }
+    private void computeTotalFloors() {
+        // Mỗi tầng = 3 block Y
+        int height = maxY - minY + 1;
+        totalFloors = Math.max(1, (height + 2) / 3); // ceil(height/3)
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // FLOOR PLACEMENT
+    // HELPERS
     // ══════════════════════════════════════════════════════════════════════
-
-    private void doPlaceFloor(MinecraftClient client, ClientPlayerEntity player) {
-        ClientWorld world = client.world;
-        if (world == null) { state = MinerState.MOVING_FORWARD; return; }
-
-        BlockPos feet = player.getBlockPos();
-        for (BlockPos fp : getFloorPositions(feet)) {
-            if (!inBounds(fp)) continue;
-            if (isAirOrPassable(world.getBlockState(fp).getBlock())) {
-                int slot = findSolidBlock(player);
-                if (slot == -1) {
-                    AutoMinerMod.msg(client, "§cHết block đặt sàn!");
-                    state = MinerState.MOVING_FORWARD;
-                    return;
-                }
-                player.getInventory().setSelectedSlot(slot);
-                lookDown(player);
-                BlockPos support = fp.down();
-                if (!isAirOrPassable(world.getBlockState(support).getBlock())) {
-                    Vec3d hitVec = Vec3d.ofCenter(support).add(0, 0.5, 0);
-                    client.interactionManager.interactBlock(player, Hand.MAIN_HAND,
-                        new BlockHitResult(hitVec, Direction.UP, support, false));
-                    cooldown = ACTION_DELAY;
-                    return;
-                }
-            }
-        }
-        state    = MinerState.MOVING_FORWARD;
-        cooldown = 2;
-    }
-
-    private BlockPos[] getFloorPositions(BlockPos feet) {
-        BlockPos under = feet.down();
-        Direction perp = getPerpendicularDir(mineDir);
-        return new BlockPos[]{ under, under.offset(perp, 1), under.offset(perp, -1) };
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // FORWARD MOVEMENT
-    // ══════════════════════════════════════════════════════════════════════
-
-    private void doMove(MinecraftClient client, ClientPlayerEntity player) {
-        lookInDirection(player, mineDir);
-        client.options.forwardKey.setPressed(true);
-
-        BlockPos feet      = player.getBlockPos();
-        BlockPos nextCenter = getLayerCenter(currentStep + 1);
-
-        boolean arrived = switch (mineDir) {
-            case NORTH -> feet.getZ() <= nextCenter.getZ();
-            case SOUTH -> feet.getZ() >= nextCenter.getZ();
-            case EAST  -> feet.getX() >= nextCenter.getX();
-            case WEST  -> feet.getX() <= nextCenter.getX();
-            case DOWN  -> feet.getY() <= nextCenter.getY();
-            default    -> false;
-        };
-
-        if (arrived) {
-            stopMoving(client);
-            currentStep++;
-            if (currentStep >= totalSteps) {
-                state = MinerState.DONE;
-            } else {
-                centerTarget = getLayerCenter(currentStep);
-                breakIndex   = 0;
-                state        = MinerState.BREAKING;
-                cooldown     = 3;
-            }
-        }
+    private void stopAll(MinecraftClient client) {
+        client.options.forwardKey.setPressed(false);
+        client.options.jumpKey.setPressed(false);
+        client.options.sneakKey.setPressed(false);
+        client.options.useKey.setPressed(false);
     }
 
     private void stopMoving(MinecraftClient client) {
         client.options.forwardKey.setPressed(false);
+        client.options.jumpKey.setPressed(false);
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // EAT / XP BOTTLE / TOTEM
-    // ══════════════════════════════════════════════════════════════════════
 
     private void tryEat(MinecraftClient client, ClientPlayerEntity player) {
         int slot = findFood(player);
-        if (slot == -1) {
-            AutoMinerMod.msg(client, "§cHết đồ ăn!");
-            state = MinerState.IDLE;
-            return;
-        }
+        if (slot == -1) { AutoMinerMod.msg(client, "§cHết đồ ăn!"); return; }
         player.getInventory().setSelectedSlot(slot);
         client.options.useKey.setPressed(true);
-        cooldown = 32;
-        state    = MinerState.IDLE;
     }
 
     private void throwExpBottle(MinecraftClient client, ClientPlayerEntity player) {
-        int bottleSlot = findItem(player, Items.EXPERIENCE_BOTTLE);
-        if (bottleSlot == -1) {
-            AutoMinerMod.msg(client, "§cKhông có Bottle o' Enchanting!");
-            state = MinerState.IDLE;
-            return;
-        }
-        swapToOffhand(client, player, bottleSlot);
+        int slot = findItem(player, Items.EXPERIENCE_BOTTLE);
+        if (slot == -1) { AutoMinerMod.msg(client, "§cKhông có EXP Bottle!"); return; }
+        swapToOffhand(client, player, slot);
         cooldown = 3;
         player.setPitch(0f);
         client.interactionManager.interactItem(player, Hand.OFF_HAND);
-        cooldown = ACTION_DELAY;
-        state    = MinerState.EQUIP_TOTEM;
+        int totem = findItem(player, Items.TOTEM_OF_UNDYING);
+        if (totem != -1) equipOffhand(client, player, totem);
     }
 
     private void equipOffhand(MinecraftClient client, ClientPlayerEntity player, int slot) {
         swapToOffhand(client, player, slot);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // INVENTORY HELPERS
-    // ══════════════════════════════════════════════════════════════════════
-
     private void swapToOffhand(MinecraftClient client, ClientPlayerEntity player, int slot) {
-        int containerSlot = (slot < 9) ? 36 + slot : slot;
+        int cs = (slot < 9) ? 36 + slot : slot;
         client.interactionManager.clickSlot(
-            player.currentScreenHandler.syncId,
-            containerSlot,
-            40,
-            SlotActionType.SWAP,
-            player
-        );
+            player.currentScreenHandler.syncId, cs, 40, SlotActionType.SWAP, player);
     }
 
-    private boolean hasTotemInOffhand(ClientPlayerEntity player) {
-        return player.getOffHandStack().getItem() == Items.TOTEM_OF_UNDYING;
+    private boolean hasTotemInOffhand(ClientPlayerEntity p) {
+        return p.getOffHandStack().getItem() == Items.TOTEM_OF_UNDYING;
     }
 
-    private boolean pickaxeLow(ClientPlayerEntity player) {
-        ItemStack main = player.getMainHandStack();
-        if (!isPickaxe(main) || !main.isDamageable()) return false;
-        int maxDur = main.getMaxDamage();
-        int curDur = maxDur - main.getDamage();
-        return (float) curDur / maxDur < DURABILITY_THRESHOLD;
+    private boolean pickaxeLow(ClientPlayerEntity p) {
+        ItemStack m = p.getMainHandStack();
+        if (!isPickaxe(m) || !m.isDamageable()) return false;
+        return (float)(m.getMaxDamage() - m.getDamage()) / m.getMaxDamage() < DURABILITY_THRESHOLD;
     }
 
-    private boolean isPickaxe(ItemStack stack) {
-        Item item = stack.getItem();
-        return item == Items.WOODEN_PICKAXE  || item == Items.STONE_PICKAXE
-            || item == Items.IRON_PICKAXE    || item == Items.GOLDEN_PICKAXE
-            || item == Items.DIAMOND_PICKAXE || item == Items.NETHERITE_PICKAXE;
+    private boolean isPickaxe(ItemStack s) {
+        Item i = s.getItem();
+        return i==Items.WOODEN_PICKAXE||i==Items.STONE_PICKAXE||i==Items.IRON_PICKAXE
+            ||i==Items.GOLDEN_PICKAXE||i==Items.DIAMOND_PICKAXE||i==Items.NETHERITE_PICKAXE;
     }
 
-    private void ensurePickaxeMainHand(ClientPlayerEntity player) {
-        if (!isPickaxe(player.getMainHandStack())) {
-            int slot = findBestPickaxe(player);
-            if (slot != -1) player.getInventory().setSelectedSlot(slot);
+    private void ensurePickaxeMainHand(ClientPlayerEntity p) {
+        if (!isPickaxe(p.getMainHandStack())) {
+            int s = findBestPickaxe(p);
+            if (s != -1) p.getInventory().setSelectedSlot(s);
         }
     }
 
-    private int findBestPickaxe(ClientPlayerEntity player) {
-        Item[] priority = {
-            Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE,
-            Items.IRON_PICKAXE, Items.STONE_PICKAXE, Items.WOODEN_PICKAXE
-        };
-        for (Item pick : priority) {
-            for (int i = 0; i < 9; i++) {
-                if (player.getInventory().getStack(i).getItem() == pick) return i;
-            }
-        }
+    private int findBestPickaxe(ClientPlayerEntity p) {
+        Item[] pr = {Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE,
+                     Items.IRON_PICKAXE, Items.STONE_PICKAXE, Items.WOODEN_PICKAXE};
+        for (Item pick : pr)
+            for (int i = 0; i < 9; i++)
+                if (p.getInventory().getStack(i).getItem()==pick) return i;
         return -1;
     }
 
-    private boolean needsEating(ClientPlayerEntity player) {
-        return player.getHungerManager().getFoodLevel() <= HUNGER_THRESHOLD;
+    private boolean needsEating(ClientPlayerEntity p) {
+        return p.getHungerManager().getFoodLevel() <= HUNGER_THRESHOLD;
     }
 
-    private int findFood(ClientPlayerEntity player) {
+    private int findFood(ClientPlayerEntity p) {
         for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getStack(i);
-            if (!stack.isEmpty() && stack.contains(DataComponentTypes.FOOD)) return i;
+            ItemStack s = p.getInventory().getStack(i);
+            if (!s.isEmpty() && s.contains(DataComponentTypes.FOOD)) return i;
         }
         return -1;
     }
 
-    private int findItem(ClientPlayerEntity player, Item item) {
+    private int findItem(ClientPlayerEntity p, Item item) {
+        for (int i = 0; i < 36; i++)
+            if (p.getInventory().getStack(i).getItem()==item) return i;
+        return -1;
+    }
+
+    private int findSolidBlock(ClientPlayerEntity p) {
         for (int i = 0; i < 9; i++) {
-            if (player.getInventory().getStack(i).getItem() == item) return i;
-        }
-        for (int i = 9; i < 36; i++) {
-            if (player.getInventory().getStack(i).getItem() == item) return i;
+            ItemStack s = p.getInventory().getStack(i);
+            if (!s.isEmpty() && isSolidPlaceable(s.getItem())) return i;
         }
         return -1;
     }
 
-    private int findSolidBlock(ClientPlayerEntity player) {
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getStack(i);
-            if (!stack.isEmpty() && isSolidPlaceable(stack.getItem())) return i;
-        }
-        return -1;
+    private boolean isSolidPlaceable(Item i) {
+        return i==Items.COBBLESTONE||i==Items.STONE||i==Items.DIRT
+            ||i==Items.GRAVEL||i==Items.OAK_PLANKS||i==Items.COBBLED_DEEPSLATE
+            ||i==Items.NETHERRACK||i==Items.SAND;
     }
-
-    private boolean isSolidPlaceable(Item item) {
-        return item == Items.COBBLESTONE      || item == Items.STONE
-            || item == Items.DIRT             || item == Items.GRAVEL
-            || item == Items.OAK_PLANKS       || item == Items.COBBLED_DEEPSLATE
-            || item == Items.NETHERRACK       || item == Items.SAND;
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // BOUNDS HELPERS
-    // ══════════════════════════════════════════════════════════════════════
 
     private void computeBounds() {
         minX = Math.min(frameA.getX(), frameB.getX());
@@ -458,36 +432,15 @@ public class AutoMinerController {
         maxZ = Math.max(frameA.getZ(), frameB.getZ());
     }
 
-    private void computeTotalSteps() {
-        totalSteps = switch (mineDir) {
-            case NORTH, SOUTH -> maxZ - minZ + 1;
-            case EAST,  WEST  -> maxX - minX + 1;
-            case DOWN         -> maxY - minY + 1;
-            default           -> 1;
-        };
-    }
-
-    private boolean inBounds(BlockPos pos) {
-        return pos.getX() >= minX && pos.getX() <= maxX
-            && pos.getY() >= minY && pos.getY() <= maxY
-            && pos.getZ() >= minZ && pos.getZ() <= maxZ;
-    }
-
-    private BlockPos clampToBounds(BlockPos pos) {
-        return new BlockPos(
-            Math.max(minX, Math.min(maxX, pos.getX())),
-            Math.max(minY, Math.min(maxY, pos.getY())),
-            Math.max(minZ, Math.min(maxZ, pos.getZ()))
-        );
+    private boolean inBounds(BlockPos p) {
+        return p.getX()>=minX&&p.getX()<=maxX
+            &&p.getY()>=minY&&p.getY()<=maxY
+            &&p.getZ()>=minZ&&p.getZ()<=maxZ;
     }
 
     private String posStr(BlockPos p) {
-        return "(" + p.getX() + "," + p.getY() + "," + p.getZ() + ")";
+        return "("+p.getX()+","+p.getY()+","+p.getZ()+")";
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // LOOK / DIRECTION HELPERS
-    // ══════════════════════════════════════════════════════════════════════
 
     private void lookAt(ClientPlayerEntity player, Vec3d target) {
         Vec3d eye = new Vec3d(
@@ -495,13 +448,11 @@ public class AutoMinerController {
             player.getY() + player.getEyeHeight(player.getPose()),
             player.getZ()
         );
-        Vec3d diff  = target.subtract(eye).normalize();
-        double hDist = Math.sqrt(diff.x * diff.x + diff.z * diff.z);
-        player.setYaw((float) Math.toDegrees(Math.atan2(-diff.x, diff.z)));
-        player.setPitch((float) Math.toDegrees(-Math.atan2(diff.y, hDist)));
+        Vec3d d = target.subtract(eye).normalize();
+        double h = Math.sqrt(d.x*d.x + d.z*d.z);
+        player.setYaw((float)Math.toDegrees(Math.atan2(-d.x, d.z)));
+        player.setPitch((float)Math.toDegrees(-Math.atan2(d.y, h)));
     }
-
-    private void lookDown(ClientPlayerEntity player) { player.setPitch(85f); }
 
     private void lookInDirection(ClientPlayerEntity player, Direction dir) {
         switch (dir) {
@@ -509,20 +460,21 @@ public class AutoMinerController {
             case SOUTH -> { player.setYaw(0f);   player.setPitch(0f); }
             case EAST  -> { player.setYaw(-90f);  player.setPitch(0f); }
             case WEST  -> { player.setYaw(90f);   player.setPitch(0f); }
-            case DOWN  -> { player.setPitch(90f); }
             default    -> {}
         }
     }
 
     private Direction getBreakFace(BlockPos target, ClientPlayerEntity player) {
-        Vec3d diff = new Vec3d(
-            player.getX(), player.getY() + player.getEyeHeight(player.getPose()), player.getZ()
+        Vec3d d = new Vec3d(
+            player.getX(),
+            player.getY() + player.getEyeHeight(player.getPose()),
+            player.getZ()
         ).subtract(Vec3d.ofCenter(target));
-        if (Math.abs(diff.y) > Math.abs(diff.x) && Math.abs(diff.y) > Math.abs(diff.z))
-            return diff.y > 0 ? Direction.UP : Direction.DOWN;
-        if (Math.abs(diff.x) > Math.abs(diff.z))
-            return diff.x > 0 ? Direction.EAST : Direction.WEST;
-        return diff.z > 0 ? Direction.SOUTH : Direction.NORTH;
+        if (Math.abs(d.y)>Math.abs(d.x)&&Math.abs(d.y)>Math.abs(d.z))
+            return d.y>0 ? Direction.UP : Direction.DOWN;
+        if (Math.abs(d.x)>Math.abs(d.z))
+            return d.x>0 ? Direction.EAST : Direction.WEST;
+        return d.z>0 ? Direction.SOUTH : Direction.NORTH;
     }
 
     private Direction getPlayerFacingDir(MinecraftClient client) {
@@ -530,27 +482,10 @@ public class AutoMinerController {
         return client.player.getHorizontalFacing();
     }
 
-    private Direction getPerpendicularDir(Direction dir) {
-        return switch (dir) {
-            case NORTH, SOUTH -> Direction.EAST;
-            case EAST,  WEST  -> Direction.NORTH;
-            default           -> Direction.EAST;
-        };
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // BLOCK HELPERS
-    // ══════════════════════════════════════════════════════════════════════
-
     private boolean isAirOrPassable(Block block) {
-        return block == Blocks.AIR
-            || block == Blocks.CAVE_AIR
-            || block == Blocks.VOID_AIR
-            || block == Blocks.WATER
-            || block == Blocks.LAVA
-            || block == Blocks.SHORT_GRASS
-            || block == Blocks.TALL_GRASS
-            || block == Blocks.VINE
-            || block == Blocks.SNOW;
+        return block==Blocks.AIR||block==Blocks.CAVE_AIR||block==Blocks.VOID_AIR
+            ||block==Blocks.WATER||block==Blocks.LAVA
+            ||block==Blocks.SHORT_GRASS||block==Blocks.TALL_GRASS
+            ||block==Blocks.VINE||block==Blocks.SNOW;
     }
-}
+    }
