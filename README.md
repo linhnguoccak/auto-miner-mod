@@ -1,0 +1,1 @@
+# auto-miner-mod
