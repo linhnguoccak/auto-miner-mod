@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "auto-miner",
+  "version": "1.0.0",
+  "name": "Auto Miner",
+  "description": "Tự động đào hầm 3x3 trong khung giới hạn",
+  "authors": ["ALB SCRIPT"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.albscript.autominer.AutoMinerMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "fabric-api": "*",
+    "minecraft": "~1.21.11"
+  }
+}
